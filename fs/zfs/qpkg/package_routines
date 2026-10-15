@@ -1,0 +1,96 @@
+######################################################################
+# Package routines for QNAP_ZFS.
+#
+# Installing this package puts files in place and the userspace tools on PATH.
+# It deliberately does not load the kernel modules, start anything, or hook
+# into boot: loading is what load.sh is for, and it is a decision.
+#
+# Nothing here may be fatal. err_log terminates the installation, and during an
+# install the paths are not all known yet, so every check below only warns.
+######################################################################
+
+QPKG_NAME="QNAP_ZFS"
+
+# Where the package was installed.
+#
+# QTS's installer sources this file, so its own SYS_QPKG_DIR - the directory
+# the payload was extracted to - is visible here. The environment variables are
+# checked as well, and the config file only as a fallback: during an install,
+# Install_Path has not been written to qpkg.conf yet, so reading it there gives
+# nothing and every path derived from it is wrong.
+#
+# Resolved per call rather than once when this file is sourced, because during
+# an install it is not known yet.
+zfs_install_dir() {
+    for _root in "${QPKG_ROOT:-}" "${SYS_QPKG_DIR:-}" "${QPKG_DIR:-}" \
+        "$(/sbin/getcfg "$QPKG_NAME" Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" \
+        /share/*/.qpkg/"$QPKG_NAME"; do
+        [ -n "$_root" ] || continue
+        if [ -d "$_root/bin" ]; then
+            printf '%s' "$_root"
+            return 0
+        fi
+    done
+
+    # Or the payload is right here, which is what happens while installing when
+    # none of the paths above is known yet.
+    for _root in . ./shared; do
+        if [ -d "$_root/bin" ]; then
+            (cd "$_root" && pwd)
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+zfs_tools() {
+    _dir=$(zfs_install_dir) || return 0
+    for _tool in "$_dir"/bin/*; do
+        [ -x "$_tool" ] || continue
+        printf '%s\n' "$_tool"
+    done
+}
+
+pkg_pre_install() {
+    return 0
+}
+
+# Never fatal: not finding things here only means the paths are not known yet.
+pkg_install() {
+    if [ -z "$(zfs_install_dir)" ]; then
+        echo "qnap-zfs: cannot tell where the package was installed yet" >&2
+    fi
+
+    return 0
+}
+
+pkg_post_install() {
+    if [ -z "$(zfs_install_dir)" ]; then
+        echo "qnap-zfs: cannot tell where the package was installed;" >&2
+        echo "qnap-zfs: run install.sh from it to put the tools on PATH" >&2
+        return 0
+    fi
+
+    mkdir -p /usr/local/bin
+    zfs_tools | while read -r _tool; do
+        ln -sfn "$_tool" "/usr/local/bin/$(basename "$_tool")"
+    done
+
+    return 0
+}
+
+pkg_pre_remove() {
+    zfs_tools | while read -r _tool; do
+        _link="/usr/local/bin/$(basename "$_tool")"
+        if [ -L "$_link" ] && [ "$(readlink "$_link")" = "$_tool" ]; then
+            rm -f "$_link"
+        fi
+    done
+
+    return 0
+}
+
+pkg_post_remove() {
+    return 0
+}
