@@ -10,10 +10,11 @@ boot, import pools, or touch anything else on the NAS.
 | | modules | userspace |
 |---|---|---|
 | **btrfs** | `btrfs.ko`, `zstd_compress.ko`, `xxhash_generic.ko`, `blake2b_generic.ko` | `btrfs`, `mkfs.btrfs`, `btrfsck`, `btrfstune`, `btrfs-image`, `btrfs-map-logical`, `btrfs-select-super`, `fsck.btrfs` |
-| **zfs** | not yet — see [Status](#status) | |
+| **zfs** | `zfs.ko`, `spl.ko`, `zcommon.ko`, `znvpair.ko`, `zavl.ko`, `icp.ko`, `zlua.ko`, `zunicode.ko`, `zzstd.ko` | `zpool`, `zfs`, `mount.zfs`, `zdb`, `zstream`, `zgenhostid`, `fsck.zfs` |
 
 Each filesystem produces two packages that carry the same payload: a QPKG
-(`QNAP_Btrfs`) for App Center, and a plain tarball for the path without it.
+(`QNAP_Btrfs`, `QNAP_ZFS`) for App Center, and a plain tarball for the path
+without it.
 
 ## Why the userspace is built static
 
@@ -141,6 +142,75 @@ match. Rebuild for the new release and reinstall:
   tools use exists in that kernel. It is built with backtrace, NLS, zoned (SMR)
   and `btrfs-convert` support disabled, none of which this package needs.
 
+### zfs
+
+* Nothing from the kernel configuration: OpenZFS brings its own SPL, crypto,
+  zstd and lua, and its `configure` checks the kernel for what it needs.
+* Modules and userspace both come from OpenZFS **2.1.15**, configured against
+  the QNAP tree. 2.1.x is the last series that supports the 5.10 kernel and
+  whose userspace ioctls match it.
+* QNAP does publish their own ZFS port, in the QuTS Hero GPL drops
+  (`zol_h520_GPL_code_beta.tar`, `zol_h520_CDDL_code_beta.tar`), but it is
+  FreeBSD's ZFS and DTrace grafted onto Linux with a renamed SPL (`lpl/`) and
+  it ships no build system, so it is reference only.
+* The userspace is static too, which needs libtool's `-all-static`: plain
+  `-static` is ignored on the libtool link line, and the first attempt produced
+  dynamically linked binaries because of it.
+* `zpool` writes its cache to `/etc/zfs/zpool.cache`. The package does not
+  create that directory (it installs files and nothing else), so if `zpool`
+  complains about it, `mkdir -p /etc/zfs` once.
+* `/dev/zfs` is created by the module. If it is missing, `grep zfs /proc/misc`
+  gives the minor number and `mknod /dev/zfs c 10 <minor>` creates it.
+
+## Known issues
+
+**Both filesystems crash the NAS on the first real write.** btrfs panicked on
+`btrfs subvolume create` on a loop-mounted image; zfs took the machine down
+while writing a file into a dataset, with pool and dataset creation and the
+mount itself working fine. Two independent filesystems failing the same way is
+not two filesystem bugs — it points at the modules not matching the kernel they
+are loaded into.
+
+The evidence that fits: the newest QTS source QNAP publishes is **5.2.3**
+(`5.2.3.20250218`, whose kernel was built `Tue Feb 18 07:40:22 CST 2025`) while
+this NAS runs **5.2.10**. The release string is `5.10.60-qnap` either way, so
+vermagic cannot detect the difference, but a kernel patched after the drop
+would give modules built against the older headers mismatched structure
+layouts.
+
+Confirmed on this NAS: `cat /proc/version` reports
+
+```
+#1 SMP Fri Jul 31 00:56:17 CST 2026
+```
+
+while the newest source QNAP publishes (`QTS_Kernel_5.2.3.20250218`) was built
+`Tue Feb 18 07:40:22 CST 2025`. The kernel this NAS runs was rebuilt 17 months
+later and the release string is identical on both sides, so nothing in these
+packages can detect the difference: they were compiled against headers that no
+longer match the running kernel, which corrupts memory in code that allocates
+and does heavy I/O — btrfs and zfs — while leaving simple modules (vsock)
+working.
+
+So the modules cannot be built correctly for this NAS until QNAP publishes the
+source for the kernel they actually ship. Their SourceForge project stops at
+QTS 5.2.3, and the NAS has no `/proc/config.gz`, so the configuration cannot be
+recovered either. Ask QNAP support for the GPL source of this QTS build: they
+are obliged to provide it. The build takes the release as a parameter
+(`QTS_GPL=... ./build.sh`), so once that source exists the packages rebuild in
+minutes.
+
+The alternative is running a QTS release whose source is published (5.2.3),
+which is a much bigger decision than waiting.
+
+Until then, do not load these modules on a NAS that matters: each attempt risks
+the machine and its data.
+
+**VMs on a ZFS pool need `/dev/zvol/<pool>/<vol>` symlinks**, which udev
+creates. On a system without udev the zvol device exists but not the symlink
+LXD's zfs driver looks for, so datasets (containers) are fine while VM disks
+are not.
+
 ## Repository layout
 
 ```
@@ -153,7 +223,7 @@ scripts/                  shared build framework
   30-make-tools.sh        userspace, in the tools container
   40-make-package.sh      QPKG + tarball
   in-container/           the parts that run inside the containers
-containers/               the two build containers
+containers/               the build containers
 fs/<name>/fs.mk           everything that differs between filesystems
 fs/<name>/qpkg/           qpkg.cfg and package_routines
 shared/                   installed verbatim by every package: extrafs.sh,
@@ -180,27 +250,43 @@ needs the NAS, and is the first thing to try after installing.
 
 ## Status
 
-**btrfs**: built, packaged and checked offline. Not yet verified on the NAS —
-the steps to run there are:
+**btrfs**: built, packaged and checked offline. On the NAS, loading worked,
+`mkfs.btrfs` worked and the filesystem mounted — then creating a subvolume
+panicked the kernel (see [Known issues](#known-issues)), so it is not verified
+end to end yet. The steps, once that is understood:
 
 ```sh
-./load.sh
-extrafs.sh status
-# a file-backed filesystem, then mount it and prove zstd works
-truncate -s 1G /share/Public/btrfs-test.img
-mkfs.btrfs /share/Public/btrfs-test.img
-mkdir -p /mnt/btrfs-test && mount -o loop,compress=zstd /share/Public/btrfs-test.img /mnt/btrfs-test
-btrfs subvolume create /mnt/btrfs-test/sub
-btrfs subvolume snapshot /mnt/btrfs-test/sub /mnt/btrfs-test/snap
-umount /mnt/btrfs-test
+cd /share/Public/qnap-btrfs
+sudo ./install.sh && sudo ./load.sh && ./extrafs.sh status
+mkdir -p "$PWD/btrfs-test/mnt"
+dd if=/dev/zero of="$PWD/btrfs-test/test.img" bs=1M count=0 seek=256
+sudo mkfs.btrfs -f "$PWD/btrfs-test/test.img"
+sudo mount -t btrfs -o loop,compress=zstd "$PWD/btrfs-test/test.img" "$PWD/btrfs-test/mnt"
+sudo btrfs subvolume create "$PWD/btrfs-test/mnt/sub"
+sudo btrfs subvolume snapshot "$PWD/btrfs-test/mnt/sub" "$PWD/btrfs-test/mnt/snap"
+sudo umount "$PWD/btrfs-test/mnt"
 ```
 
-**zfs**: not attempted yet. QNAP publishes their own ZFS port in the QuTS Hero
-GPL drops (`zol_h520_GPL_code_beta.tar`, `zol_h520_CDDL_code_beta.tar`), but it
-is FreeBSD's ZFS/DTrace code grafted onto Linux with a renamed SPL (`lpl/`) and
-ships no build system, so it is not a buildable base. The plan is upstream
-OpenZFS 2.1.x against the QNAP tree, with those dumps as reference, and to drop
-zfs rather than ship something that cannot work.
+**zfs**: modules and userspace build and the packages are produced; nothing has
+been loaded on the NAS yet. The steps there:
+
+```sh
+cd /share/Public/qnap-zfs
+sudo ./install.sh && sudo ./load.sh && ./extrafs.sh status
+mkdir -p "$PWD/zfs-test"
+dd if=/dev/zero of="$PWD/zfs-test/pool.img" bs=1M count=0 seek=512
+sudo zpool create -f -m none testpool "$PWD/zfs-test/pool.img"
+sudo zfs create -o mountpoint="$PWD/zfs-test/data" testpool/data
+sudo sh -c "echo hello > '$PWD/zfs-test/data/hello'"
+sudo zfs snapshot testpool/data@snap
+sudo zfs list -r testpool
+sudo zfs destroy testpool/data@snap && sudo zfs destroy testpool/data
+sudo zpool destroy testpool
+sudo rm -rf "$PWD/zfs-test"
+```
+
+Test in a directory on the volume you are working in, not in `/tmp`: on QTS
+that is a small RAM filesystem, and a file-backed pool does not fit.
 
 ## Appendix: using this with LXD
 
